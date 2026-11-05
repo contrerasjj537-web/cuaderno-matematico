@@ -36,6 +36,10 @@ dependencies:
   cupertino_icons: ^1.0.8
   flutter_math_fork: ^0.7.4
   http: ^1.6.0
+  image_picker: ^1.2.4
+  path_provider: ^2.1.6
+  pdf: ^3.13.1
+  printing: ^5.15.1
 
 dev_dependencies:
   flutter_test:

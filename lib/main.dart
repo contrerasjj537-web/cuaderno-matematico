@@ -1,20 +1,30 @@
-// Cuaderno v3
-// Requiere:  flutter pub add flutter_math_fork http
+// Cuaderno v4
+// Requiere:
+//   flutter pub add flutter_math_fork http image_picker path_provider pdf printing
 //
-// Novedades v3: fondo tipo pizarra (verde, negra o cualquier color), tiza,
-// puntero visible (punto, lápiz o marcador), selección con lazo y conversión
-// de escritura a mano en LaTeX (manual o automática al hacer una pausa).
+// Novedades v4: guardado automático local, imágenes en la hoja y exportación
+// a PDF. (v3: pizarra, puntero, lazo y reconocimiento a LaTeX.)
 // Archivos auxiliares: recognizer.dart, pen_cursor.dart, color_dialog.dart.
 
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_math_fork/flutter_math.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:printing/printing.dart';
 
 import 'color_dialog.dart';
 import 'pen_cursor.dart';
@@ -64,6 +74,7 @@ enum ToolType {
   rectangulo,
   ejes,
   formula,
+  imagen,
 }
 
 extension ToolX on ToolType {
@@ -119,6 +130,8 @@ abstract class Item {
         return Stroke.fromJson(j);
       case 'shape':
         return ShapeItem.fromJson(j);
+      case 'image':
+        return ImageItem.fromJson(j);
       default:
         return FormulaItem.fromJson(j);
     }
@@ -283,6 +296,43 @@ class FormulaItem extends Item {
         pos: _off(j['pos']),
         size: (j['size'] as num).toDouble(),
         color: Color(j['color'] as int),
+      );
+}
+
+/// Imagen insertada en la hoja (se serializa en base64).
+class ImageItem extends Item {
+  final Uint8List bytes;
+  Offset pos;
+  double width;
+  final double aspect; // alto / ancho
+
+  ImageItem({
+    required this.bytes,
+    required this.pos,
+    required this.width,
+    required this.aspect,
+  });
+
+  @override
+  bool hit(Offset p, double tol) => false; // la manejan sus propios gestos
+
+  @override
+  void translate(Offset d) => pos += d;
+
+  @override
+  Map<String, dynamic> toJson() => {
+        't': 'image',
+        'img': base64Encode(bytes),
+        'pos': _o(pos),
+        'w': width,
+        'aspect': aspect,
+      };
+
+  factory ImageItem.fromJson(Map<String, dynamic> j) => ImageItem(
+        bytes: base64Decode(j['img'] as String),
+        pos: _off(j['pos']),
+        width: (j['w'] as num).toDouble(),
+        aspect: (j['aspect'] as num).toDouble(),
       );
 }
 
@@ -674,6 +724,9 @@ Rect itemBounds(Item it) {
     }
     return Rect.fromPoints(it.a, it.b);
   }
+  if (it is ImageItem) {
+    return it.pos & Size(it.width, it.width * it.aspect);
+  }
   if (it is FormulaItem) {
     return it.pos &
         Size(it.size * math.max(2, it.latex.length * 0.5), it.size * 1.6);
@@ -758,7 +811,8 @@ class NotebookPage extends StatefulWidget {
   State<NotebookPage> createState() => _NotebookPageState();
 }
 
-class _NotebookPageState extends State<NotebookPage> {
+class _NotebookPageState extends State<NotebookPage>
+    with WidgetsBindingObserver {
   // Documento
   final List<NotePage> pages = [NotePage()];
   int pageIdx = 0;
@@ -790,6 +844,13 @@ class _NotebookPageState extends State<NotebookPage> {
   int _recogToken = 0;
   bool _converting = false;
   ({String latex, List<Item> items, Rect bounds})? _suggestion;
+
+  // Imágenes, PDF y guardado
+  final ImagePicker _picker = ImagePicker();
+  final GlobalKey _pageKey = GlobalKey();
+  bool _exporting = false;
+  bool _loaded = false;
+  Timer? _saveTimer;
 
   // Vista (zoom / desplazamiento)
   double scale = 1;
@@ -852,6 +913,7 @@ class _NotebookPageState extends State<NotebookPage> {
     ToolType.rectangulo: Icons.crop_square,
     ToolType.ejes: Icons.stacked_line_chart,
     ToolType.formula: Icons.functions,
+    ToolType.imagen: Icons.image,
   };
 
   static const _toolNames = {
@@ -869,6 +931,7 @@ class _NotebookPageState extends State<NotebookPage> {
     ToolType.rectangulo: 'Rectángulo',
     ToolType.ejes: 'Ejes cartesianos',
     ToolType.formula: 'Fórmula LaTeX',
+    ToolType.imagen: 'Insertar imagen',
   };
 
   static const _snippets = <(String, String)>[
@@ -894,11 +957,15 @@ class _NotebookPageState extends State<NotebookPage> {
       ? Offset((p.dx / 12).round() * 12.0, (p.dy / 12).round() * 12.0)
       : p;
 
-  void _changed() => setState(() => _version++);
+  void _changed() {
+    setState(() => _version++);
+    _scheduleSave();
+  }
 
   void _push(NotePage pg, Cmd c) {
     pg.undo.add(c);
     pg.redo.clear();
+    _scheduleSave();
   }
 
   double _pressure(PointerEvent e) {
@@ -1047,6 +1114,10 @@ class _NotebookPageState extends State<NotebookPage> {
 
       case ToolType.formula:
         _editFormula(pos: _snap(p));
+        break;
+
+      case ToolType.imagen:
+        _insertImage(_snap(p));
         break;
 
       case ToolType.linea:
@@ -1227,6 +1298,7 @@ class _NotebookPageState extends State<NotebookPage> {
       _adaptInk();
       _version++;
     });
+    _scheduleSave();
   }
 
   void _addPage() {
@@ -1260,6 +1332,7 @@ class _NotebookPageState extends State<NotebookPage> {
       }
       _version++;
     });
+    _scheduleSave();
   }
 
   // ── Fórmulas ──
@@ -1451,7 +1524,7 @@ class _NotebookPageState extends State<NotebookPage> {
         },
         child: DecoratedBox(
           decoration: BoxDecoration(
-            border: movable
+            border: (movable && !_exporting)
                 ? Border.all(color: Colors.indigo.withValues(alpha: 0.35))
                 : null,
             borderRadius: BorderRadius.circular(4),
@@ -1527,10 +1600,92 @@ class _NotebookPageState extends State<NotebookPage> {
   void _onHover(PointerHoverEvent e) => _cursor.value = e.localPosition;
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _load();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) _saveNow();
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _autoTimer?.cancel();
+    _saveNow();
     _cursor.dispose();
     super.dispose();
+  }
+
+  // ── Guardado local automático ──
+
+  Future<File?> _storeFile() async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      return File('${dir.path}/cuaderno.json');
+    } catch (_) {
+      return null; // plataforma sin almacenamiento (p. ej. web)
+    }
+  }
+
+  void _scheduleSave() {
+    _saveTimer?.cancel();
+    _saveTimer = Timer(const Duration(seconds: 2), _saveNow);
+  }
+
+  Future<void> _saveNow() async {
+    _saveTimer?.cancel();
+    if (!_loaded) return; // no pisar el archivo antes de haberlo leído
+    try {
+      final f = await _storeFile();
+      if (f == null) return;
+      final data = jsonEncode({
+        'v': 1,
+        'pageIdx': pageIdx,
+        'pages': [for (final p in pages) p.toJson()],
+      });
+      final tmp = File('${f.path}.tmp');
+      await tmp.writeAsString(data);
+      await tmp.rename(f.path);
+    } catch (e) {
+      debugPrint('No se pudo guardar: $e');
+    }
+  }
+
+  Future<void> _load() async {
+    try {
+      final f = await _storeFile();
+      if (f != null && await f.exists()) {
+        try {
+          final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+          final loaded = [
+            for (final p in j['pages'] as List)
+              NotePage.fromJson(Map<String, dynamic>.from(p as Map)),
+          ];
+          if (loaded.isNotEmpty && mounted) {
+            setState(() {
+              pages
+                ..clear()
+                ..addAll(loaded);
+              pageIdx = math.min((j['pageIdx'] as int?) ?? 0, pages.length - 1);
+              _adaptInk();
+              _version++;
+            });
+          }
+        } catch (e) {
+          // Archivo dañado: se conserva una copia antes de volver a guardar.
+          debugPrint('No se pudo leer el cuaderno: $e');
+          try {
+            await f.copy('${f.path}.bak');
+          } catch (_) {}
+        }
+      }
+    } finally {
+      _loaded = true;
+    }
   }
 
   // ── Selección con lazo ──
@@ -1696,6 +1851,193 @@ class _NotebookPageState extends State<NotebookPage> {
     );
   }
 
+  // ── Imágenes ──
+
+  Widget _imageWidget(ImageItem it) {
+    final movable = tool == ToolType.mover;
+    return IgnorePointer(
+      ignoring: !(movable || tool == ToolType.borrador),
+      child: GestureDetector(
+        onTap: () {
+          if (tool == ToolType.borrador) {
+            _deleteImage(it);
+          } else if (movable) {
+            _editImage(it);
+          }
+        },
+        onPanStart: (_) => _fTotal = Offset.zero,
+        onPanUpdate: (d) {
+          if (!movable) return;
+          final dl = d.delta / scale;
+          it.pos += dl;
+          _fTotal += dl;
+          setState(() {});
+        },
+        onPanEnd: (_) {
+          final t = _fTotal;
+          _fTotal = Offset.zero;
+          if (movable && t != Offset.zero) {
+            _push(page, Cmd(() => it.pos -= t, () => it.pos += t));
+          }
+        },
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            border: (movable && !_exporting)
+                ? Border.all(color: Colors.indigo.withValues(alpha: 0.35))
+                : null,
+          ),
+          child: Image.memory(
+            it.bytes,
+            width: it.width,
+            height: it.width * it.aspect,
+            fit: BoxFit.fill,
+            gaplessPlayback: true,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _insertImage(Offset pos) async {
+    final pg = page;
+    try {
+      final x = await _picker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 1600,
+        imageQuality: 85,
+      );
+      if (x == null || !mounted) return;
+      final bytes = await x.readAsBytes();
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      final w = frame.image.width.toDouble();
+      final h = frame.image.height.toDouble();
+      frame.image.dispose();
+      codec.dispose();
+
+      var width = math.min(320.0, w);
+      if (width * h / w > 700) width = 700 * w / h;
+      final height = width * h / w;
+      final it = ImageItem(
+        bytes: bytes,
+        pos: Offset(
+          pos.dx.clamp(0.0, math.max(0.0, kPageW - width)).toDouble(),
+          pos.dy.clamp(0.0, math.max(0.0, kPageH - height)).toDouble(),
+        ),
+        width: width,
+        aspect: h / w,
+      );
+      pg.items.add(it);
+      _push(pg, Cmd(() => pg.items.remove(it), () => pg.items.add(it)));
+      _changed();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('No se pudo insertar la imagen: $e')));
+    }
+  }
+
+  void _deleteImage(ImageItem it) {
+    final pg = page;
+    pg.items.remove(it);
+    _push(pg, Cmd(() => pg.items.add(it), () => pg.items.remove(it)));
+    _changed();
+  }
+
+  Future<void> _editImage(ImageItem it) async {
+    double w = it.width;
+    final res = await showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: const Text('Imagen'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(height: 120, child: Image.memory(it.bytes)),
+              const SizedBox(height: 8),
+              const Align(
+                  alignment: Alignment.centerLeft, child: Text('Tamaño')),
+              Slider(
+                min: 60,
+                max: kPageW,
+                value: w.clamp(60.0, kPageW).toDouble(),
+                onChanged: (v) => setD(() => w = v),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, 'delete'),
+                child: const Text('Eliminar')),
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, 'cancel'),
+                child: const Text('Cancelar')),
+            FilledButton(
+                onPressed: () => Navigator.pop(ctx, 'ok'),
+                child: const Text('Aceptar')),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (res == 'delete') {
+      _deleteImage(it);
+    } else if (res == 'ok' && w != it.width) {
+      final old = it.width;
+      final nw = w;
+      it.width = nw;
+      _push(page, Cmd(() => it.width = old, () => it.width = nw));
+      _changed();
+    }
+  }
+
+  // ── Exportar a PDF ──
+
+  /// Captura cada página tal como se ve (papel, tinta, fórmulas e imágenes)
+  /// y arma un PDF A4 con todas.
+  Future<void> _exportPdf() async {
+    if (_exporting) return;
+    final original = pageIdx;
+    final doc = pw.Document();
+    setState(() => _exporting = true);
+    try {
+      for (var i = 0; i < pages.length; i++) {
+        _goto(i);
+        await WidgetsBinding.instance.endOfFrame;
+        await WidgetsBinding.instance.endOfFrame;
+        final boundary =
+            _pageKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
+        if (boundary == null) continue;
+        final img = await boundary.toImage(pixelRatio: 2);
+        final data = await img.toByteData(format: ui.ImageByteFormat.png);
+        if (data == null) continue;
+        final png = data.buffer.asUint8List();
+        doc.addPage(pw.Page(
+          pageFormat: PdfPageFormat.a4,
+          margin: pw.EdgeInsets.zero,
+          build: (_) => pw.Image(pw.MemoryImage(png), fit: pw.BoxFit.fill),
+        ));
+      }
+      _goto(original);
+      final bytes = await doc.save();
+      if (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS) {
+        await Printing.sharePdf(bytes: bytes, filename: 'cuaderno.pdf');
+      } else {
+        await Printing.layoutPdf(
+            name: 'cuaderno.pdf', onLayout: (_) async => bytes);
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('No se pudo exportar: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _exporting = false);
+    }
+  }
+
   // ── Interfaz ──
 
   Widget _pageView() {
@@ -1708,32 +2050,52 @@ class _NotebookPageState extends State<NotebookPage> {
           color: Colors.white,
           boxShadow: [BoxShadow(blurRadius: 10, color: Colors.black38)],
         ),
-        child: ClipRect(
-          child: Stack(
-            children: [
-              Positioned.fill(
-                child: RepaintBoundary(
-                    child: CustomPaint(painter: PaperPainter(pg.paper, pg.bg))),
-              ),
-              Positioned.fill(
-                child: RepaintBoundary(
-                    child: CustomPaint(painter: InkPainter(pg.items, _version))),
-              ),
-              Positioned.fill(
-                child: CustomPaint(painter: LivePainter(_live)),
-              ),
-              Positioned.fill(
-                child: CustomPaint(
-                    painter: SelectionPainter(_selectionBounds(), _lasso)),
-              ),
-              for (final f in pg.items.whereType<FormulaItem>())
-                Positioned(
-                  key: ObjectKey(f),
-                  left: f.pos.dx,
-                  top: f.pos.dy,
-                  child: _formulaWidget(f),
+        child: RepaintBoundary(
+          key: _pageKey, // se captura para exportar a PDF
+          child: ClipRect(
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: RepaintBoundary(
+                      child: CustomPaint(painter: PaperPainter(pg.paper, pg.bg)),
+                    ),
+                  ),
                 ),
-            ],
+                for (final im in pg.items.whereType<ImageItem>())
+                  Positioned(
+                    key: ObjectKey(im),
+                    left: im.pos.dx,
+                    top: im.pos.dy,
+                    child: _imageWidget(im),
+                  ),
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: RepaintBoundary(
+                      child: CustomPaint(painter: InkPainter(pg.items, _version)),
+                    ),
+                  ),
+                ),
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: CustomPaint(painter: LivePainter(_live)),
+                  ),
+                ),
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: CustomPaint(
+                        painter: SelectionPainter(_selectionBounds(), _lasso)),
+                  ),
+                ),
+                for (final f in pg.items.whereType<FormulaItem>())
+                  Positioned(
+                    key: ObjectKey(f),
+                    left: f.pos.dx,
+                    top: f.pos.dy,
+                    child: _formulaWidget(f),
+                  ),
+              ],
+            ),
           ),
         ),
       ),
@@ -2057,6 +2419,8 @@ class _NotebookPageState extends State<NotebookPage> {
                 setState(() => fingerDraws = !fingerDraws);
               } else if (v == 'fit') {
                 _fit();
+              } else if (v == 'pdf') {
+                _exportPdf();
               }
             },
             itemBuilder: (_) => [
@@ -2068,6 +2432,10 @@ class _NotebookPageState extends State<NotebookPage> {
               const PopupMenuItem<String>(
                 value: 'fit',
                 child: Text('Ajustar hoja a la pantalla'),
+              ),
+              const PopupMenuItem<String>(
+                value: 'pdf',
+                child: Text('Exportar a PDF'),
               ),
             ],
           ),
@@ -2134,6 +2502,15 @@ class _NotebookPageState extends State<NotebookPage> {
                   ),
                 ),
               ),
+              if (_exporting)
+                const Positioned.fill(
+                  child: AbsorbPointer(
+                    child: ColoredBox(
+                      color: Colors.black38,
+                      child: Center(child: CircularProgressIndicator()),
+                    ),
+                  ),
+                ),
               if (_converting || _suggestion != null)
                 Positioned(
                   top: 8,
